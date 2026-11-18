@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 /**
  * llm-wiki-pipeline.mjs —— LLM-Wiki 后处理管线（P2）
- * lint → 索引重建 → 记忆体同步 → log.md。零外部依赖。
- * 用法: node llm-wiki-pipeline.mjs [--lint] [--index] [--sync] [--all] [--dry-run]
+ * lint → 索引重建 → 记忆体同步 → log.md。核心零外部依赖；仅 --extract 分支调用 Python（见 README）。
+ * 用法: node llm-wiki-pipeline.mjs [--lint] [--index] [--sync] [--all] [--dry-run] [--extract]
+ * 注：--extract 是**显式 opt-in**，刻意不并入 --all，避免定时任务往 raw/ 写伴生件。
  */
 import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, mkdirSync, rmSync, utimesSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { zstdDecompressSync } from "node:zlib";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import { execFileSync, execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
@@ -34,8 +37,8 @@ const STALE_DAYS = 90;
 const rawArgs = process.argv.slice(2);
 const args = new Set(rawArgs);
 const DRY = args.has("--dry-run");
-const doAll = ![...args].some(a => ["--lint", "--index", "--sync", "--rate", "--usage", "--okf", "--prune-memory", "--dsh-export", "--docs-sync", "--reconcile", "--compile-patterns"].includes(a));
-const RUN = { lint: doAll || args.has("--lint"), index: doAll || args.has("--index"), sync: doAll || args.has("--sync"), usage: doAll || args.has("--usage"), okf: doAll || args.has("--okf"), compilePatterns: doAll || args.has("--compile-patterns"), prune: doAll || args.has("--prune-memory"), dsh: doAll || args.has("--dsh-export"), docs: doAll || args.has("--docs-sync") };
+const doAll = ![...args].some(a => ["--lint", "--index", "--sync", "--rate", "--usage", "--okf", "--prune-memory", "--dsh-export", "--docs-sync", "--reconcile", "--compile-patterns", "--extract"].includes(a));
+const RUN = { lint: doAll || args.has("--lint"), index: doAll || args.has("--index"), sync: doAll || args.has("--sync"), usage: doAll || args.has("--usage"), okf: doAll || args.has("--okf"), compilePatterns: doAll || args.has("--compile-patterns"), prune: doAll || args.has("--prune-memory"), dsh: doAll || args.has("--dsh-export"), docs: doAll || args.has("--docs-sync"), extract: args.has("--extract") };
 const RECONCILE_TARGET = rawArgs[rawArgs.indexOf("--reconcile") + 1];
 const DO_RECONCILE = args.has("--reconcile") && RECONCILE_TARGET;
 const RATE_TARGET = rawArgs[rawArgs.indexOf("--rate") + 1];
@@ -1122,6 +1125,86 @@ async function syncMemory(pages) {
   return result;
 }
 
+/** 解析 Python 解释器：显式 env > DSH 捆绑运行时 > PATH。优先能 import pypdf 的那个（PDF 分支需要）。 */
+function pythonCli() {
+  const cands = [];
+  if (process.env.LLM_WIKI_PYTHON) cands.push(process.env.LLM_WIKI_PYTHON);
+  const rt = join(homedir(), ".dsh/dsh-runtimes");
+  try { for (const d of readdirSync(rt)) for (const exe of ["python.exe", "python"]) { const p = join(rt, d, "dependencies/python", exe); if (existsSync(p)) cands.push(p); } } catch {}
+  cands.push("python", "python3", "py");
+  const uniq = [...new Set(cands)];
+  const canPdf = (c) => { try { return spawnSync(c, ["-c", "import pypdf"], { stdio: "ignore", timeout: 30000 }).status === 0; } catch { return false; } };
+  let pdfCapable = null;
+  for (const c of uniq) if (canPdf(c)) { pdfCapable = c; break; }
+  if (!uniq.length) return null;
+  return { command: pdfCapable || uniq[0], pdfCapable, probed: uniq.length };
+}
+
+/** --extract：为 raw/ 下缺失伴生件的二进制素材生成 .extracted.md（只创建，不覆盖不删除）。 */
+async function rawExtract(dry) {
+  const dir = join(VAULT, "raw/documents");
+  if (!existsSync(dir)) return { error: "无 raw/documents 目录" };
+  const script = join(dirname(fileURLToPath(import.meta.url)), "raw-extract.py");
+  if (!existsSync(script)) return { error: "缺少 raw-extract.py（未随管线安装？）: " + script };
+  const py = pythonCli();
+  if (!py) return { error: "未找到 Python 解释器，可设 LLM_WIKI_PYTHON" };
+  const out = join(tmpdir(), "llm-wiki-extract-" + process.pid + ".json");
+  const a = [script, "--dir", dir, "--out", out];
+  if (dry) a.push("--dry-run");
+  if (args.has("--overwrite")) a.push("--overwrite");
+  if (args.has("--limit")) { const n = rawArgs[rawArgs.indexOf("--limit") + 1]; if (n) a.push("--limit", String(n)); }
+  if (args.has("--only")) { const v = rawArgs[rawArgs.indexOf("--only") + 1]; if (v) a.push("--only", String(v)); }
+  // stdio: "ignore" + 结果落 JSON —— 不捕获子进程输出，规避受限沙箱的命名管道限制
+  const r = spawnSync(py.command, a, { stdio: "ignore", timeout: 900000, env: { ...process.env, PYTHONIOENCODING: "utf-8" } });
+  let res = null;
+  try { res = JSON.parse(readFileSync(out, "utf8")); } catch {}
+  try { rmSync(out, { force: true }); } catch {}
+  if (!res) return { error: "抽取子进程无结果（exit=" + r.status + "，python=" + py.command + "）" };
+  res.python = py.command;
+  if (!py.pdfCapable) res.warning = "无解释器可 import pypdf，PDF 分支不可用（.doc/.docx 仍可）";
+  return res;
+}
+
+/**
+ * raw 素材体检：三类故障分型（阈值来自本机 10 份真实伴生件的分布校准）
+ *   missing   —— 二进制素材没有 .extracted.md 伴生件（正文取不到）
+ *   watermark —— 文本层是水印/用户名重复行（topline>=0.30 且 unique<0.25；真实公文该比值 0.004~0.159）
+ *   thin      —— 有正文但每页字数 <460（真实正文 509~2028 字/页，封面通知 422）
+ */
+function rawGapReport() {
+  const RAW = join(VAULT, "raw");
+  const EXT = new Set([".pdf", ".doc", ".docx"]);
+  const missing = [], watermark = [], thin = [];
+  let checked = 0, ok = 0;
+  let files = [];
+  try { files = readdirSync(RAW, { recursive: true }); } catch {}
+  for (const f of files) {
+    const p = join(RAW, String(f));
+    let st; try { st = statSync(p); } catch { continue; }
+    if (!st.isFile()) continue;
+    const m = String(f).match(/\.[A-Za-z0-9]+$/);
+    if (!m || !EXT.has(m[0].toLowerCase())) continue;
+    checked++;
+    const side = p.slice(0, p.length - m[0].length) + ".extracted.md";
+    if (!existsSync(side)) { missing.push(relative(VAULT, p)); continue; }
+    let t = ""; try { t = readFileSync(side, "utf8"); } catch {}
+    const pages = +((t.match(/^pages:\s*(\d+)/m) || [])[1] || 1) || 1;
+    const body = t.replace(/^[\s\S]*?\n---\s*\n/, "").replace(/<!--[\s\S]*?-->/g, "");
+    const lines = body.split("\n").map(l => l.trim()).filter(Boolean);
+    const chars = body.replace(/\s+/g, "").length;
+    if (!lines.length) { watermark.push({ path: relative(VAULT, p), why: "伴生件无有效文本行" }); continue; }
+    const cnt = new Map();
+    for (const l of lines) cnt.set(l, (cnt.get(l) || 0) + 1);
+    let top = 0, topLine = "";
+    for (const [l, n] of cnt) if (n > top) { top = n; topLine = l; }
+    const share = top / lines.length, uniq = cnt.size / lines.length;
+    if (share >= 0.30 && uniq < 0.25) { watermark.push({ path: relative(VAULT, p), why: "重复行 " + (share * 100).toFixed(0) + "% 主导，样例行：" + topLine.slice(0, 24) }); continue; }
+    if (chars / pages < 460) { thin.push({ path: relative(VAULT, p), why: (chars / pages).toFixed(0) + " 字/页 × " + pages + " 页，疑似只有封面/通知，附件正文未入库" }); continue; }
+    ok++;
+  }
+  return { checked, ok, missing, watermark, thin };
+}
+
 function appendLog(entry) {
   const logPath = join(VAULT, "log.md");
   try {
@@ -1160,6 +1243,12 @@ async function main() {
     const shown = wantType ? r.issues.filter(x => x.type === wantType) : r.issues;
     for (const i of shown.slice(0, wantType ? 40 : 8)) console.log("  [问题]", i.path, i.message);
     for (const o of r.orphans.slice(0, 5)) console.log("  [孤立]", o.rel);
+    const g = rawGapReport();
+    console.log("raw 体检:", g.checked, "素材 | 正常", g.ok, "| 未抽取", g.missing.length, "| 水印退化", g.watermark.length, "| 疑似缺件", g.thin.length);
+    for (const x of g.missing.slice(0, 6)) console.log("  [未抽取]", x);
+    for (const x of g.watermark.slice(0, 6)) console.log("  [水印退化]", x.path, "-", x.why);
+    for (const x of g.thin.slice(0, 6)) console.log("  [疑似缺件]", x.path, "-", x.why);
+    summary.push("raw:" + g.missing.length + "未抽/" + g.watermark.length + "水印/" + g.thin.length + "薄件");
     summary.push("lint:" + r.issues.length + "问题/" + r.orphans.length + "孤立/" + r.stale.length + "stale");
   }
   if (RUN.index) {
@@ -1186,6 +1275,13 @@ async function main() {
     console.log("\n== docs-sync ==");
     if (DRY) console.log("(--dry-run) 将把 mnemon Documents 回流为 wiki 页");
     else { const r = docsSync(); console.log("回流:", JSON.stringify(r)); summary.push("docs:" + (r.imported || 0) + "个"); }
+  }
+  if (RUN.extract) {
+    console.log("\n== extract ==");
+    const r = await rawExtract(DRY);
+    console.log("结果:", JSON.stringify({ scanned: r.scanned, created: r.created, failed: r.failed, dry: r.dry_run, python: r.python, warning: r.warning, error: r.error }));
+    for (const it of (r.items || []).slice(0, 8)) console.log("  [" + it.status + "]", it.source, it.error || it.note || "");
+    summary.push("extract:" + (r.created || 0) + "新建" + (r.failed ? "/" + r.failed + "失败" : "") + (r.error ? " ERR:" + r.error : ""));
   }
   if (RUN.dsh) {
     console.log("\n== dsh-export ==");

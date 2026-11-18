@@ -18,7 +18,7 @@
 ## 设计原则
 
 1. **三层分工**：`raw/`（原始素材，永不删除）→ `wiki/`（模型维护的真相源）→ `schema.md`（写页/检索纪律）。
-2. **低代码、零第三方依赖**：1 个插件 + 2 个技能 + 若干零依赖 Node 脚本；不引入向量库/数据库。
+2. **低代码、零第三方依赖**：1 个插件 + 2 个技能 + 若干零依赖 Node 脚本；不引入向量库/数据库。（例外：`--extract` 的 PDF 分支可选依赖 `pypdf`，缺失时该分支报错跳过，核心管线不受影响）
 3. **只读优先**：蒸馏、stale 复核、编译候选都只产清单；写 USER.md / 归档页面必须经确认。
 4. **可审计、可重建**：wiki 是 git 仓库；mnemon 索引可从 wiki 重建；每次自动化都写日志。
 
@@ -101,7 +101,7 @@ node ~/.dsh/bin/pipeline-health.mjs       # 生成首份健康快照
 
 | 命令 | 作用 |
 |---|---|
-| `--lint` | frontmatter / 双链 / 孤立 / stale / 断链（磁盘为准）/ 缺来源 |
+| `--lint` | frontmatter / 双链 / 孤立 / stale / 断链（磁盘为准）/ 缺来源 / **raw 素材体检** |
 | `--okf` | 补 OKF v0.2 字段（幂等） |
 | `--index` | 重建导航与热投影 |
 | `--sync` | wiki H2 块 → mnemon（哈希增量 + 语义边） |
@@ -109,10 +109,19 @@ node ~/.dsh/bin/pipeline-health.mjs       # 生成首份健康快照
 | `--compile-patterns` | 孤立页聚类成 pattern（证据门槛 3） |
 | `--docs-sync` | mnemon Documents → wiki |
 | `--dsh-export` | DSH 会话 → `raw/sessions/dsh/` |
+| `--extract` | **为 `raw/` 缺失的素材生成 `.extracted.md` 伴生件**（调 `raw-extract.py`）；可与 `--dry-run` / `--overwrite` / `--limit` 连用 |
 | `--prune-memory` | 清理来源已消失的块 |
 | `--reconcile` | 邻域调和报告（只读，可开 LLM） |
 | `--rate <页> --rating useful\|outdated` | 质量反馈 |
 | `--all` / `--all --dry-run` | 全量 / 预览 |
+
+> **素材抽取分支（`--extract`）设计说明**
+> - **刻意不并入 `--all`**：伴生件写在 `raw/` 里，而守则第 1 条把 `raw/` 定为原始素材区，写入权留给人。每日定时任务因此不会往 `raw/` 落任何东西，只在显式执行 `--extract` 时生成。
+> - **只创建、不覆盖、不删除**：已存在的 `.extracted.md` 一律 skip；要重抽需显式 `--overwrite`，且仍旧只重写伴生件，原始文件永不改动。结果写前有 `--min-chars`（默认 40）下限，加密件/图片型空壳会被拒绝而不是产出垃圾伴生件。
+> - **三类故障分型**（`--lint` 每次自动体检，阈值由本机 10 份真实伴生件分布校准）：
+>   `未抽取`＝二进制素材没有伴生件；`水印退化`＝文本层被重复水印行主导（重复行占比 ≥30% 且唯一行比例 <25%，真实公文仅 0.4%~15.9%）；`疑似缺件`＝每页字数 <460（真实正文 509~2028 字/页，只有封面通知的会落到 422）。
+> - **格式契约**：伴生件 frontmatter 保持 `source / ingested_at / type / pages` 四键（守则第 2 条），并追加 `chars`、`extractor` 便于追溯；`.doc` 抽取件头部固定写入「Word 自动编号不在文本流、条号需回原文核对」的注意事项，避免下游把推断条号当原文。
+> - **依赖**：`.doc` 走纯标准库（MS-CFB + [MS-DOC] piece table，元数据不自洽时扫描扇区反查目录链）；`.docx` 走 zipfile；`.pdf` 需要 `pypdf`。解释器按 `LLM_WIKI_PYTHON` → DSH 捆绑运行时 → PATH 顺序解析，优先选中能 `import pypdf` 的那个。子进程一律 `stdio: ignore` + 结果落 JSON，不捕获管道输出。
 
 ## 检索路由
 
