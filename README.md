@@ -73,7 +73,7 @@ dsh plugin --profile web add github:iwtown/dsh-llm-wiki
 **方式 B：全量本地部署（推荐）**
 
 ```bash
-git clone https://github.com/iwtown/dsh-llm-wiki.git
+git clone https://github.com/JohnnyTank0208/dsh-llm-wiki.git
 cd dsh-llm-wiki && ./install.sh          # Linux / WSL
 # 或
 .\install.ps1                             # Windows（-NoSchedule 跳过定时任务）
